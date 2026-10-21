@@ -169,6 +169,9 @@ button.lrow.editing { background: var(--accent-soft); }
 .cats .bar i { display: block; height: 100%; background: var(--expense); border-radius: 3px; opacity: .85; }
 .muted-note { color: var(--muted); font-size: 14px; }
 
+/* import notice */
+.banner { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px 16px; padding: 12px 16px; border: 1px solid var(--accent); border-radius: 10px; background: var(--accent-soft); font-size: 14px; }
+
 /* comparison */
 .compare-head { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: flex-start; gap: 10px 16px; }
 .compare-head > div:first-child { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
@@ -230,6 +233,14 @@ table.cmp { width: 100%; min-width: 640px; border-collapse: collapse; font-size:
       <button class="ghost" id="this-month" type="button">이번 달</button>
     </nav>
   </header>
+
+  <div class="banner" id="import" hidden>
+    <span id="import-text"></span>
+    <div class="actions">
+      <button class="secondary" type="button" id="import-go">계정으로 옮기기</button>
+      <button class="ghost" type="button" id="import-skip">나중에</button>
+    </div>
+  </div>
 
   <section class="summary" aria-label="이번 달 요약">
     <div class="stat inc"><span class="label">수입</span><span class="v" id="s-inc">0<small>원</small></span></div>
@@ -342,12 +353,13 @@ table.cmp { width: 100%; min-width: 640px; border-collapse: collapse; font-size:
 </div>
 <div class="toast" id="toast" role="status" aria-live="polite"></div>
 
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/dist/umd/supabase.min.js"></script>
 <script>
 (() => {
   const EXP_CATS = ["식비", "카페·간식", "교통", "주거·통신", "생활용품", "쇼핑", "문화·여가", "의료·건강", "교육", "경조사", "기타"];
   const INC_CATS = ["월급", "용돈", "부수입", "이자·환급", "기타"];
   const DOW = "일월화수목금토";
-  const LOCAL_KEY = "gagyebu-local-v1";
+  const LOCAL_KEY = "gagyebu-local-v1";   // where the earlier browser-only version kept its records
 
   const $ = (id) => document.getElementById(id);
   const pad = (n) => String(n).padStart(2, "0");
@@ -362,7 +374,7 @@ table.cmp { width: 100%; min-width: 640px; border-collapse: collapse; font-size:
 
   const now = new Date();
   const state = {
-    mode: "loading",          // loading | saved | memory
+    mode: "loading",          // loading | ready | signedout | error | noclient
     entries: [],
     budget: 0,
     view: { y: now.getFullYear(), m: now.getMonth() },
@@ -374,7 +386,6 @@ table.cmp { width: 100%; min-width: 640px; border-collapse: collapse; font-size:
     cmpRange: "period",       // period (1일~오늘) | month
   };
 
-  // ---------- storage (this browser only) ----------
   const newId = () => "l" + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
 
   // First visit: a few marked example rows so the ledger shows how it works.
@@ -418,75 +429,118 @@ table.cmp { width: 100%; min-width: 640px; border-collapse: collapse; font-size:
       type, amount, category, memo, date: `${m}-${pad(d)}`, id: newId() + "c" + i, createdAt: 100 + i, example: true,
     }));
   }
-  const SEED = 2;
 
-  const local = {
-    load() {
-      try {
-        const raw = localStorage.getItem(LOCAL_KEY);
-        if (raw) {
-          const d = JSON.parse(raw);
-          state.entries = Array.isArray(d.entries) ? d.entries.filter((e) => e && e.date && typeof e.amount === "number") : [];
-          state.budget = Number(d.budget) || 0;
-          // Older saves still showing examples get the comparison examples too.
-          if ((d.seed || 1) < SEED && state.entries.some((e) => e.example)) {
-            state.entries = state.entries.concat(compareExampleEntries());
-            localStorage.setItem(LOCAL_KEY, JSON.stringify({ entries: state.entries, budget: state.budget, seed: SEED }));
-          }
-        } else {
-          state.entries = exampleEntries().concat(compareExampleEntries());
-          state.budget = 1500000;
-        }
-        state.mode = "saved";
-      } catch (e) {
-        state.entries = exampleEntries().concat(compareExampleEntries());
-        state.budget = 1500000;
-        state.mode = "memory";
-      }
-    },
-    save() {
-      try {
-        localStorage.setItem(LOCAL_KEY, JSON.stringify({ entries: state.entries, budget: state.budget, seed: SEED }));
-        state.mode = "saved";
-      } catch (e) {
-        if (state.mode !== "memory") toast("이 브라우저에 저장할 수 없어요. 창을 닫으면 기록이 사라져요.");
-        state.mode = "memory";
-      }
-    },
-  };
+  // ---------- storage (Supabase) ----------
+  // Publishable key. There is no login, so anyone holding this page can read and change the ledger
+  // (see supabase-schema.sql for the matching table policies).
+  const SUPABASE_URL = "https://wznfinrjqsejojvaunru.supabase.co";
+  const SUPABASE_KEY = "sb_publishable_g5O7g5o1AUSy4eLWZ6MjOw_zBXEQTfn";
+  let sb = null;
+  let pendingImport = [];
 
-  function writeFailed() {
-    toast("저장하지 못했어요. 다시 시도해 주세요.");
+  const fromRow = (r) => ({
+    id: r.id, type: r.type, amount: Number(r.amount), category: r.category, memo: r.memo || "",
+    date: r.date, example: r.example, createdAt: Date.parse(r.created_at) || 0,
+  });
+  const toRow = (e) => ({
+    type: e.type, amount: e.amount, category: String(e.category).slice(0, 20),
+    memo: String(e.memo || "").slice(0, 60), date: e.date, example: false,
+  });
+  const check = ({ data, error }) => { if (error) throw error; return data; };
+
+  function writeFailed(err) {
+    console.error(err);
+    toast("저장하지 못했어요. 연결을 확인하고 다시 시도해 주세요.");
   }
 
   async function saveEntry(entry, id) {
-    if (id) state.entries = state.entries.map((e) => e.id === id ? { ...entry, id } : e);
-    else state.entries.push({ ...entry, id: newId() });
-    local.save();
+    const q = id ? sb.from("entries").update(toRow(entry)).eq("id", id) : sb.from("entries").insert(toRow(entry));
+    const e = fromRow(check(await q.select().single()));
+    state.entries = id ? state.entries.map((x) => x.id === id ? e : x) : state.entries.concat(e);
   }
   async function removeEntry(id) {
+    check(await sb.from("entries").delete().eq("id", id));
     state.entries = state.entries.filter((e) => e.id !== id);
-    local.save();
     render();
   }
   async function saveBudget(n) {
+    check(await sb.from("settings").upsert({ id: 1, budget: n, updated_at: new Date().toISOString() }));
     state.budget = n;
-    local.save();
     render();
   }
-
-  function init() {
-    local.load();
-    render();
+  async function clearExamples() {
+    check(await sb.from("entries").delete().eq("example", true));
+    state.entries = state.entries.filter((e) => !e.example);
   }
 
-  // Keep other open tabs of this page in sync.
-  window.addEventListener("storage", (ev) => {
-    if (ev.key !== LOCAL_KEY) return;
-    local.load();
-    if (state.editing && !state.entries.some((e) => e.id === state.editing)) resetForm();
+  async function fetchAll() {
+    const settings = check(await sb.from("settings").select("budget").eq("id", 1).maybeSingle());
+    const rows = check(await sb.from("entries").select("*").order("date").order("created_at").limit(5000));
+    state.budget = settings ? Number(settings.budget) || 0 : 0;
+    state.entries = rows.map(fromRow);
+    return settings;
+  }
+
+  async function loadAll() {
+    const settings = await fetchAll();
+    if (settings) return;
+    // First visit: a default budget and marked example rows that show how the ledger works.
+    check(await sb.from("settings").insert({ id: 1, budget: 1500000, seeded: true }));
+    const rows = exampleEntries().concat(compareExampleEntries()).map((e) => ({ ...toRow(e), example: true }));
+    check(await sb.from("entries").insert(rows));
+    await fetchAll();
+  }
+
+  async function init() {
     render();
+    if (!window.supabase || !window.supabase.createClient) {
+      state.mode = "noclient";
+      render();
+      return;
+    }
+    sb = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY, { auth: { persistSession: false } });
+    try {
+      await loadAll();
+      state.mode = "ready";
+    } catch (err) {
+      console.error(err);
+      state.mode = "error";
+      toast("기록을 불러오지 못했어요. 새로고침해 주세요.");
+    }
+    render();
+    offerLocalImport();
+  }
+
+  // Pick up changes made on another device when this tab comes back into view.
+  document.addEventListener("visibilitychange", async () => {
+    if (document.visibilityState !== "visible" || state.mode !== "ready" || state.editing) return;
+    try { await fetchAll(); render(); } catch (e) { /* keep what is on screen */ }
   });
+
+  // ---------- old browser-only records ----------
+  function offerLocalImport() {
+    let d = null;
+    try { d = JSON.parse(localStorage.getItem(LOCAL_KEY) || "null"); } catch (e) { d = null; }
+    pendingImport = d && Array.isArray(d.entries)
+      ? d.entries.filter((e) => e && !e.example && /^\d{4}-\d{2}-\d{2}$/.test(e.date) && e.amount > 0 && (e.type === "income" || e.type === "expense"))
+      : [];
+    $("import").hidden = !pendingImport.length || state.mode !== "ready";
+    $("import-text").textContent = `이 브라우저에 예전 방식으로 저장된 기록 ${pendingImport.length}건이 있어요. 지금 계정으로 옮길까요?`;
+  }
+  $("import-go").addEventListener("click", async (ev) => {
+    const btn = ev.currentTarget;
+    btn.disabled = true;
+    try {
+      const rows = check(await sb.from("entries").insert(pendingImport.map(toRow)).select());
+      state.entries = state.entries.concat(rows.map(fromRow));
+      try { localStorage.removeItem(LOCAL_KEY); } catch (e) { }
+      $("import").hidden = true;
+      toast(`기록 ${rows.length}건을 옮겼어요.`);
+      render();
+    } catch (err) { writeFailed(err); } finally { btn.disabled = false; }
+  });
+  $("import-skip").addEventListener("click", () => { $("import").hidden = true; });
+
 
   // ---------- derived ----------
   function monthData() {
@@ -503,8 +557,13 @@ table.cmp { width: 100%; min-width: 640px; border-collapse: collapse; font-size:
   // ---------- render ----------
   function render() {
     const md = monthData();
-    $("mode").textContent = state.mode === "loading" ? "기록을 불러오는 중…"
-      : state.mode === "saved" ? "이 브라우저에 자동 저장돼요" : "저장되지 않아요 · 창을 닫으면 사라져요";
+    $("mode").textContent = {
+      loading: "기록을 불러오는 중…",
+      ready: "Supabase에 자동 저장돼요",
+      error: "Supabase에서 기록을 불러오지 못했어요",
+      noclient: "Supabase에 연결할 수 없어요",
+    }[state.mode];
+    if (state.mode !== "ready") $("import").hidden = true;
     $("month-label").textContent = `${state.view.y}년 ${state.view.m + 1}월`;
     $("book-title").textContent = `${state.view.m + 1}월 거래내역`;
     $("this-month").hidden = state.view.y === now.getFullYear() && state.view.m === now.getMonth();
@@ -556,6 +615,10 @@ table.cmp { width: 100%; min-width: 640px; border-collapse: collapse; font-size:
     const head = `<div class="lrow head"><span>일자</span><span>내용</span><span class="r">지출</span><span class="r">수입</span><span class="r">잔액</span></div>`;
     if (state.mode === "loading") {
       $("ledger").innerHTML = head + `<div class="empty"><strong>기록을 불러오는 중이에요</strong><span>잠시만 기다려 주세요.</span></div>`;
+      return;
+    }
+    if (state.mode === "error" || state.mode === "noclient") {
+      $("ledger").innerHTML = head + `<div class="empty"><strong>Supabase에 연결하지 못했어요</strong><span>인터넷 연결을 확인하고 새로고침해 주세요. 계속 안 되면 Supabase에 가계부 테이블이 만들어져 있는지 확인해 주세요.</span></div>`;
       return;
     }
     let bal = md.carry;
@@ -810,7 +873,7 @@ table.cmp { width: 100%; min-width: 640px; border-collapse: collapse; font-size:
 
   $("entry-form").addEventListener("submit", async (ev) => {
     ev.preventDefault();
-    if (state.readOnly || state.mode === "loading") return;
+    if (state.readOnly || state.mode !== "ready") return;
     const amount = digits($("f-amount").value);
     const date = $("f-date").value;
     if (!amount) { $("f-msg").textContent = "금액을 입력해 주세요."; $("f-amount").focus(); return; }
@@ -897,11 +960,12 @@ table.cmp { width: 100%; min-width: 640px; border-collapse: collapse; font-size:
     delete btn.dataset.armed;
     btn.textContent = "예시 기록 모두 지우기";
     const count = state.entries.filter((e) => e.example).length;
-    state.entries = state.entries.filter((e) => !e.example);
-    if (state.editing && !state.entries.some((e) => e.id === state.editing)) resetForm();
-    local.save();
-    render();
-    toast(`예시 기록 ${count}건을 지웠어요.`);
+    try {
+      await clearExamples();
+      if (state.editing && !state.entries.some((e) => e.id === state.editing)) resetForm();
+      render();
+      toast(`예시 기록 ${count}건을 지웠어요.`);
+    } catch (err) { writeFailed(err); }
   });
 
   // ---------- month + budget ----------
@@ -922,7 +986,7 @@ table.cmp { width: 100%; min-width: 640px; border-collapse: collapse; font-size:
   $("b-input").addEventListener("input", (ev) => { const n = digits(ev.target.value); ev.target.value = n ? won(n) : ""; });
   $("b-form").addEventListener("submit", async (ev) => {
     ev.preventDefault();
-    if (state.readOnly) return;
+    if (state.readOnly || state.mode !== "ready") return;
     const n = digits($("b-input").value);
     try {
       await saveBudget(n);
